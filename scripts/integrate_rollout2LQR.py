@@ -21,7 +21,6 @@ from testtt.jax_nr import NR_tracker_original#, dynamics, predict_output, get_ja
 from testtt.utilities import sim_constants # Import simulation constants
 from testtt.jax_mm_rta import *
 
-
 import jax
 import jax.numpy as jnp
 import immrax as irx
@@ -133,6 +132,7 @@ class OffboardControl(Node):
         # MoCap related variables
         self.mocap_initialized: bool = False
         self.full_rotations: int = 0
+        self.max_yaw_stray = 15 * np.pi / 180
 
         # PX4 variables
         self.offboard_heartbeat_counter: int = 0
@@ -154,6 +154,8 @@ class OffboardControl(Node):
 
         # Initialize newton-raphson algorithm parameters
         self.last_input: jnp.ndarray = jnp.array([self.MASS * self.GRAVITY, 0.01, 0.01, 0.01]) # last input to the controller
+        self.hover_input_planar: jnp.ndarray = jnp.array([self.MASS * self.GRAVITY, 0.]) # hover input to the controller
+        self.odom_counter = 0
         self.T_LOOKAHEAD: float = 0.8 # (s) lookahead time for the controller in seconds
         self.T_LOOKAHEAD_PRED_STEP: float = 0.1 # (s) we do state prediction for T_LOOKAHEAD seconds ahead in intervals of T_LOOKAHEAD_PRED_STEP seconds
         self.INTEGRATION_TIME: float = self.control_period # integration time constant for the controller in seconds
@@ -166,23 +168,38 @@ class OffboardControl(Node):
         NR_tracker_original(init_state, init_input, init_ref, self.T_LOOKAHEAD, self.T_LOOKAHEAD_PRED_STEP, self.INTEGRATION_TIME, self.MASS) # JIT-compile the NR tracker function
 
 
-
-
         # Initialize rta_mm_gpr variables
         n_obs = 9
         x0 = jnp.array(init_state[0:5])  # Initial state vector for testing
         self.obs = jnp.tile(jnp.array([[0, x0[1], get_gp_mean(actual_disturbance_GP, 0.0, x0)[0]]]),(n_obs,1))
 
-        self.x_pert = 2 * jnp.array([0.01, 0.01, 0.01, 0.01, 0.01])
+        self.x_pert = 1e-4 * jnp.array([1., 1., 1., 1., 1.])
         ix0 = irx.icentpert(x0, self.x_pert)
         u0 = jnp.array(init_input[0:2])  # Initial input vector for testing
         w0 = jnp.array(init_noise)  # Initial noise vector for testing
         print(f"{x0=}, {ix0=}, {ix0.shape=}")
 
         # JIT-compile the linearization system function and do LQR control for ref and feedback
-        A,B = jitted_linearize_system(quad_sys_planar, x0, u0, w0)
+        time0 = time.time()
+        A, B = jitted_linearize_system(quad_sys_planar, x0, u0, w0)
+        print(f"{A=},{B=}")
+        print(f"Time taken for linearization {time.time() - time0}\n")
+
+        time0 = time.time()
+        A, B = jitted_linearize_system(quad_sys_planar, x0, u0, w0)
+        print(f"{A=},{B=}")
+        print(f"Time taken for linearization after jit {time.time() - time0}")
+
+        # Do LQR
+        time0 = time.time()
         K_reference, P, _ = control.lqr(A, B, Q_ref_planar, R_ref_planar)
         K_feedback, P, _ = control.lqr(A, B, Q_planar, R_planar)
+        print(f"{K_feedback= }, {K_reference=}, Time taken for LQR: {time.time() - time0}")
+
+        time0 = time.time()
+        K_reference, P, _ = control.lqr(A, B, Q_ref_planar, R_ref_planar)
+        K_feedback, P, _ = control.lqr(A, B, Q_planar, R_planar)
+        print(f"{K_feedback= }, {K_reference=}, Time taken for LQR part 2: {time.time() - time0}")
 
         # Set up rollout parameters
         t0 = 0.0  # Initial time
@@ -194,27 +211,34 @@ class OffboardControl(Node):
         # JIT-compile rollout and collection_id_jax functions
         time0 = time.time()
         reachable_tube, rollout_ref, rollout_feedfwd_input = jitted_rollout(0.0, ix0, x0, K_feedback, K_reference, self.obs, self.tube_horizon, self.tube_timestep, self.perm, self.sys_mjacM) # JIT compile the rollout function for performance
+        reachable_tube.block_until_ready()
+        rollout_ref.block_until_ready()
+        rollout_feedfwd_input.block_until_ready()
         print(f"Time taken for rollout: {time.time() - time0} seconds")
 
         time0 = time.time()
         reachable_tube, rollout_ref, rollout_feedfwd_input = jitted_rollout(0.0, ix0, x0, K_feedback, K_reference, self.obs, self.tube_horizon, self.tube_timestep, self.perm, self.sys_mjacM)
+        reachable_tube.block_until_ready()
+        rollout_ref.block_until_ready()
+        rollout_feedfwd_input.block_until_ready()
         print(f"Time taken for rollout after jit : {time.time() - time0} seconds")
 
         time0 = time.time()
         violation_safety_time_idx = collection_id_jax(rollout_ref, reachable_tube)
-        print(f"Time taken for collection_id: {time.time() - time0} , Collection ID: {violation_safety_time_idx}")
+        print(f"Collection ID: {violation_safety_time_idx}, Time taken for collection_id: {time.time() - time0}")
 
         time0 = time.time()
         violation_safety_time_idx = collection_id_jax(rollout_ref, reachable_tube)
-        print(f"Time taken for collection_id after jax: {time.time()-time0}, CollectionID: {violation_safety_time_idx}")
+        print(f"Collection ID: {violation_safety_time_idx}, Time taken for collection_id after jit: {time.time()-time0}")
 
         time0 = time.time()
         applied_u = u_applied(x0, x0, u0, K_feedback)
-        print(f"Time taken for u_applied: {time.time() - time0} seconds, Applied u: {applied_u}")
+        print(f"Applied u: {applied_u} Time taken for u_applied: {time.time() - time0} seconds")
 
         time0 = time.time()
         applied_u = u_applied(x0, x0, u0, K_feedback)
-        print(f"Time taken for u_applied: {time.time() - time0} seconds, Applied u: {applied_u}")
+        print(f"Applied u: {applied_u} Time taken for u_applied after jit: {time.time() - time0} seconds")
+
         self.last_lqr_update_time: float = 0.0  # Initialize last LQR update time
         self.first_LQR: bool = True  # Flag to indicate if this is the first LQR update
         self.collection_time: float = 0.0  # Time at which the collection starts
@@ -278,7 +302,6 @@ class OffboardControl(Node):
     def vehicle_odometry_subscriber_callback(self, msg) -> None:
         """Callback function for vehicle odometry topic subscriber."""
         print("==" * 30)
-        print("\n\n")
         self.x = msg.position[0]
         self.y = msg.position[1]
         self.z = msg.position[2] #+ (2.25 * self.sim) # Adjust z for simulation, new gazebo model has ground level at around -1.39m 
@@ -308,18 +331,32 @@ class OffboardControl(Node):
         self.ROT = self.rotation_object.as_matrix()
         self.omega = np.array([self.p, self.q, self.r])
 
-        print(f"in odom, output: {self.output_vector}")
+        print(f"in odom, flat output: {self.output_vector}")
         if self.first_LQR:
-            t0 = time.time()
+            self.odom_counter += 1
+            t00 = time.time()
             noise = jnp.array([0.0])  # Small noise to avoid singularity in linearization
-            A,B = jitted_linearize_system(quad_sys_planar, self.rta_mm_gpr_state_vector_planar, jnp.array([sim_constants.MASS * sim_constants.GRAVITY, 0.0]), noise)
+            # t0 = time.time()
+            A, B = jitted_linearize_system(quad_sys_planar, self.rta_mm_gpr_state_vector_planar, self.hover_input_planar, noise)
+            A, B = np.array(A), np.array(B)
+            # print(f"Time to linearize system: {time.time() - t0} seconds")
+
+            # t0 = time.time()
             K, P, _ = control.lqr(A, B, Q_planar, R_planar)
             self.feedback_K = 1 * K
+            # print(f"Time taken for LQR synthesis for K_feedback: {time.time() - t0} seconds")
 
+            # t0 = time.time()
             K, P, _ = control.lqr(A, B, Q_ref_planar, R_ref_planar)  # Compute the LQR gain matrix
             self.reference_K = 1 * K  # Store the reference gain matrix
+            # print(f"Time taken for LQR synthesis for K_reference: {time.time() - t0} seconds")
+
+            
             self.last_lqr_update_time = time.time() - self.T0  # Set the last LQR update time to the current time
-            print(f"Odom: time taken for LQR update: {time.time() - t0} seconds")
+            print(f"Odom: time taken for entire LQR update: {time.time() - t00} seconds")
+
+            # if self.odom_counter > 5:
+            #     exit(0)
         ODOMETRY_DEBUG_PRINT = False
         if ODOMETRY_DEBUG_PRINT:
             # print(f"{self.full_state_vector=}")
@@ -329,6 +366,50 @@ class OffboardControl(Node):
             print(f"{self.roll = }, {self.pitch = }, {self.yaw = }(rads)")
             # print(f"{self.rotation_object.as_euler('xyz', degrees=True) = } (degrees)")
             # print(f"{self.ROT = }")
+
+    def rollout_callback(self):
+        """Callback function for the rollout timer."""
+        print(f"\nIn rollout callback at time: ", time.time() - self.T0)
+        try:
+            self.time_from_start = time.time() - self.T0
+            t00 = time.time()  # Start time for rollout computation
+            thresh = 1.0
+            current_time = self.time_from_start
+            current_state = self.rta_mm_gpr_state_vector_planar
+            current_state_interval = irx.icentpert(current_state, self.x_pert)
+            print(f"{current_time= }, {self.collection_time= }")
+
+            if current_time >= self.collection_time:
+                print("Unsafe region begins now. Recomputing reachable tube and reference trajectory.")
+                t0 = time.time()  # Reset time for rollout computation
+                self.reachable_tube, self.rollout_ref, self.rollout_feedfwd_input = jitted_rollout(
+                    current_time, current_state_interval, current_state, self.feedback_K, self.reference_K, self.obs, self.tube_horizon, self.tube_timestep, self.perm, self.sys_mjacM
+                )
+                self.reachable_tube.block_until_ready()
+                self.rollout_ref.block_until_ready()
+                self.rollout_feedfwd_input.block_until_ready()
+                # print(f"Time taken by rollout: {time.time() - t0:.4f} seconds")
+
+                # t0 = time.time()  # Reset time for collection index computation
+                t_index = collection_id_jax(self.rollout_ref, self.reachable_tube, thresh)
+                t_index = int(t_index)
+                # print(f"Time taken for collection index computation: {time.time() - t0:.4f} seconds")
+
+                safety_horizon = t_index * self.tube_timestep
+                self.collection_time = current_time + safety_horizon  # Update the collection time based on the current time and index
+                print(f"{self.collection_time=}\n{safety_horizon=}")
+
+                self.traj_idx = 0
+            else:
+                print("You're safe!")
+            print(f"Time taken for whole rollout process: {time.time() - t00:.4f} seconds")
+
+
+        except AttributeError as e:
+            print("Ignoring missing attribute:", e)
+            return
+        except Exception as e:
+            raise  # Re-raise all other types of exceptions            
 
 
     def vehicle_status_subscriber_callback(self, vehicle_status) -> None:
@@ -666,22 +747,22 @@ class OffboardControl(Node):
 
     def control_administrator(self) -> None:
         self.time_from_start = time.time() - self.T0
-        print(f"In control administrator at {self.time_from_start:.2f} seconds")
+        print(f"\nIn control administrator at {self.time_from_start:.2f} seconds")
         ref_lqr_planar, ref_lqr_3D, ref_nr = self.get_ref(self.time_from_start)
         ctrl_T0 = time.time()
 
         NR_new_u, _ = NR_tracker_original(self.nr_state_vector, self.last_input, ref_nr, self.T_LOOKAHEAD, self.T_LOOKAHEAD_PRED_STEP, self.INTEGRATION_TIME, self.MASS)
         print(f"Time taken for NR tracker: {time.time() - ctrl_T0:.4f} seconds")
-        LQR_new_u_planar = self.lqr_administrator_planar(ref_lqr_planar, self.rta_mm_gpr_state_vector_planar, self.last_input[0:2], self.output_vector)  # Compute LQR control input for planar system
+        # LQR_new_u_planar = self.lqr_administrator_planar(ref_lqr_planar, self.rta_mm_gpr_state_vector_planar, self.last_input[0:2], self.output_vector)  # Compute LQR control input for planar system
         # LQR_new_u_3D = self.lqr_administrator_3D(ref_lqr_3D, self.nr_state_vector, self.last_input, self.output_vector)  # Compute LQR control input
         rta_new_u_planar = self.rta_mm_gpr_administrator(ref_lqr_planar, self.rta_mm_gpr_state_vector_planar, self.last_input[0:2], self.output_vector)  # Compute RTA-MM GPR control input for planar system
 
         control_comp_time = time.time() - ctrl_T0 # Time taken for control computation
-        print(f"Entire control Computation Time: {control_comp_time:.4f} seconds, Good for {1/control_comp_time:.2f}Hz control loop")
+        print(f"\nEntire control Computation Time: {control_comp_time:.4f} seconds, Good for {1/control_comp_time:.2f}Hz control loop")
 
 
         print(f"{NR_new_u =}")
-        print(f"{LQR_new_u_planar =}")
+        # print(f"{LQR_new_u_planar =}")
         # print(f"{LQR_new_u_3D =}")  
         print(f"{rta_new_u_planar =}")
 
@@ -712,16 +793,17 @@ class OffboardControl(Node):
                                     ]
         self.update_logged_data(state_input_ref_log_info)
         print("==" * 30)
-        print("\n\n")
 
     def update_lqr_feedback(self, sys, state, input, noise):
-            print(f"UPDATING LQR")
+            print(f"\nUPDATING LQR")
+            t0 = time.time()
             A, B = jitted_linearize_system(sys, state, input, noise)  # Linearize the system dynamics
             K, P, _ = control.lqr(A, B, Q_planar, R_planar)
             self.feedback_K = 1 * K
 
             K, P, _ = control.lqr(A, B, Q_ref_planar, R_ref_planar)  # Compute the LQR gain matrix
             self.reference_K = 1 * K  # Store the reference gain matrix
+            print(f"LQR Update time: {time.time()-t0}")
 
             self.last_lqr_update_time = self.time_from_start  # Update the last LQR update time
             if self.first_LQR:
@@ -740,10 +822,10 @@ class OffboardControl(Node):
         print(f"In LQR Administrator: {self.time_from_start=:.2f} and {self.last_lqr_update_time=:.2f}, difference: {self.time_from_start - self.last_lqr_update_time:.2f}")
         t0 = time.time()  # Start time for LQR computation
 
-
-        if (self.time_from_start - self.last_lqr_update_time) >= 0.5 or self.first_LQR:  # Re-linearize and re-compute the LQR gain X seconds
+        if (self.time_from_start - self.last_lqr_update_time) >= 1.0 or self.first_LQR:  # Re-linearize and re-compute the LQR gain X seconds
             noise = jnp.array([0.0])  # Small noise to avoid singularity in linearization
             self.update_lqr_feedback(quad_sys_planar, state, input, noise)
+            print(f"Time taken to update LQR {time.time - t0}")
 
         error = ref - state  # Compute the error between the reference and the current state
         nominal = self.feedback_K @ error  # Compute the nominal control input
@@ -765,57 +847,13 @@ class OffboardControl(Node):
         print(f"Time taken for LQR computation: {time.time() - t0:.4f} seconds")
         return clipped
 
-    def rollout_callback(self):
-        """Callback function for the rollout timer."""
-        print(f"In rollout callback at time: ", time.time() - self.T0)
-        try:
-            self.time_from_start = time.time() - self.T0
-
-            t00 = time.time()  # Start time for rollout computation
-            thresh = 0.5
-            current_time = self.time_from_start
-            current_state = self.rta_mm_gpr_state_vector_planar
-            current_state_interval = irx.icentpert(current_state, self.x_pert)
-            print(f"Time taken before if statement: {time.time() - t00:.4f} seconds")
-            print(f"{current_time= }, {self.collection_time= }")
-            if current_time >= self.collection_time:
-                print("Unsafe region begins now. Recomputing reachable tube and reference trajectory.")
-                # t0 = time.time()  # Reset time for rollout computation
-                self.reachable_tube, self.rollout_ref, self.rollout_feedfwd_input = jitted_rollout(
-                    current_time, current_state_interval, current_state, self.feedback_K, self.reference_K, self.obs, self.tube_horizon, self.tube_timestep, self.perm, self.sys_mjacM
-                )
-                # print(f"Time taken by rollout: {time.time() - t0:.4f} seconds")
-
-                # t0 = time.time()  # Reset time for collection index computation
-                # t_arr = np.arange(current_time, current_time + self.tube_horizon, self.tube_timestep)
-                # print(f"Time taken by t_arr creation: {time.time() - t0:.4f} seconds")
-
-                # t0 = time.time()  # Reset time for collection index computation
-                t_index = collection_id_jax(self.rollout_ref, self.reachable_tube, thresh)
-                # print(f"Time taken for collection index computation: {time.time() - t0:.4f} seconds")
-
-                # t0 = time.time()  # Reset time for collection index computation
-                self.collection_time = current_time + t_index * self.tube_timestep  # Update the collection time based on the current time and index
-                # self.collection_time = t_arr[t_index]
-                # print(f"Time taken to change collection time: {time.time() - t0:.4f} seconds")
-                # print(f"{self.collection_time=}, {current_time + t_index*self.tube_timestep=}")
-
-                self.traj_idx = 0
-            print(f"Time taken for whole rollout process: {time.time() - t00:.4f} seconds")
-            # print(f"{t_index= }, {self.collection_time=}")
-        except AttributeError as e:
-            print("Ignoring missing attribute:", e)
-            return
-        except Exception as e:
-            raise  # Re-raise all other types of exceptions            
-
     def rta_mm_gpr_administrator(self, ref, state, input, output):
         """Run the RTA-MM administrator to compute the control inputs."""
         self.time_from_start = time.time() - self.T0 # Update time from start of the program
-        print(f"In RTA-MM GPR Administrator at {self.time_from_start=:.2f}")
+        print(f"\nIn RTA-MM GPR Administrator at {self.time_from_start=:.2f}")
         t0 = time.time()  # Start time for RTA-MM GPR computation
 
-        if (self.time_from_start - self.last_lqr_update_time) >= 0.5 or self.first_LQR:  # Re-linearize and re-compute the LQR gain X seconds
+        if (self.time_from_start - self.last_lqr_update_time) >= 5.0 or self.first_LQR or abs(self.yaw) > self.max_yaw_stray:  # Re-linearize and re-compute the LQR gain X seconds
             noise = jnp.array([0.0])  # Small noise to avoid singularity in linearization
             self.update_lqr_feedback(quad_sys_planar, state, input, noise)
 
@@ -823,6 +861,7 @@ class OffboardControl(Node):
         current_state_interval = irx.icentpert(current_state, self.x_pert)
         applied_input = u_applied(current_state, self.rollout_ref[self.traj_idx, :], self.rollout_feedfwd_input[self.traj_idx, :], self.feedback_K)
         self.traj_idx += 1
+        print(f"{self.traj_idx=}")
 
         PRINT_RTA_DEBUG = True  # Set to True to print debug information for RTA-MM GPR
         if PRINT_RTA_DEBUG:

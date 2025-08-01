@@ -6,6 +6,7 @@ from testtt.utilities import sim_constants # Import simulation constants
 from .TVGPR import TVGPR # Import the TVGPR class for Gaussian Process Regression
 from .GPR import GPR # Import the GPR class for Gaussian Process Regression
 import control
+import numpy as np
 
 ## Some configurations
 jax.config.update("jax_enable_x64", True)
@@ -53,6 +54,7 @@ def collection_id_jax(xref, xemb, threshold=0.3):
 
 ## Rollout function
 # @partial(jax.jit, static_argnames=['T', 'dt', 'perm', 'sys_mjacM'])
+@partial(jax.jit, static_argnames=['T', 'dt', 'perm', 'sys_mjacM'])
 def rollout(t_init, ix, xc, K_feed, K_reference, obs, T, dt, perm, sys_mjacM):
     def mean_disturbance (t, x) :
             return GP.mean(jnp.hstack((t, x[1]))).reshape(-1)    
@@ -126,8 +128,8 @@ def rollout(t_init, ix, xc, K_feed, K_reference, obs, T, dt, perm, sys_mjacM):
     _, xx = jax.lax.scan(step, (irx.i2ut(ix), xc, irx.interval(MS0)), tt) #TODO: change variable names to be more descriptive
     return jnp.vstack((irx.i2ut(ix), xx[0])), jnp.vstack((xc, xx[1])), jnp.vstack(xx[2]) #TODO: change variable names to be more descriptive
 
-jitted_rollout = jax.jit(rollout, static_argnames=['T', 'dt', 'perm', 'sys_mjacM']) # JIT compile the rollout function for performance
-
+# jitted_rollout = jax.jit(rollout, static_argnames=['T', 'dt', 'perm', 'sys_mjacM']) # JIT compile the rollout function for performance
+jitted_rollout = rollout
 
 ## Planar Case
 class PlanarMultirotorTransformed(irx.System) :
@@ -156,8 +158,8 @@ quad_sys_planar = PlanarMultirotorTransformed()
 ulim_planar = irx.interval([0, -1],[21, 1]) # Input saturation interval -> -5 <= u1 <= 15, -5 <= u2 <= 5
 Q_planar = jnp.array([1, 1, 1, 1, 1]) * jnp.eye(quad_sys_planar.xlen) # weights that prioritize overall tracking of the reference (defined below)
 R_planar = jnp.array([1, 1]) * jnp.eye(2)
-Q_ref_planar =jnp.array([60, 60, 300, 300, 5]) * jnp.eye(quad_sys_planar.xlen) # Different weights that prioritize reference reaching origin
-R_ref_planar = jnp.array([80, 80]) * jnp.eye(2)
+Q_ref_planar =jnp.array([20, 50, 500, 500, 1]) * jnp.eye(quad_sys_planar.xlen) # Different weights that prioritize reference reaching origin
+R_ref_planar = jnp.array([20, 20]) * jnp.eye(2)
 
 ## 3D Case
 class ThreeDMultirotorTransformed(irx.System):
@@ -205,12 +207,13 @@ R_3D = jnp.array([1, 1, 1, 1]) * jnp.eye(4)  # weights for the control input (th
 
 
 ## JAX Linearization Function
+@partial(jit, static_argnums=0)
 def jax_linearize_system(sys, x0, u0, w0):
     """Compute the Jacobian of the system dynamics function with respect to state and input at the initial conditions."""
     A, B = jax.jacfwd(sys.f, argnums=(1, 2))(0, x0, u0, w0) # Compute the Jacobian of the system dynamics function with respect to state and input at the initial conditions
     return A, B
-jitted_linearize_system = jax.jit(jax_linearize_system, static_argnums=0)
-
+# jitted_linearize_system = jax.jit(jax_linearize_system, static_argnums=0)
+jitted_linearize_system = jax_linearize_system
 
 
 
